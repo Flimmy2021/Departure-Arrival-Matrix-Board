@@ -136,7 +136,10 @@ bool isLiveApiData = false;
 bool apModeActive = false;
 bool animNeeded = false; // wird beim Rendern gesetzt, wenn ein Text scrollen muss
 String lastApiStatus = "Initialisiere...";
+unsigned long infoUntilMs = 0; // solange millis() darunter liegt, zeigt das Display den Verbindungs-Infoschirm
 String lastClockStr = "";
+static const char *AP_SSID = "AIRPORT-BOARD-SETUP";
+String apIpStr = "192.168.4.1";
 
 unsigned long lastSwitchMs = 0;
 unsigned long lastPollMs = 0;
@@ -525,6 +528,7 @@ void updateAllFlightData() {
     // Bei kurzzeitigem Fehler bleiben bereits geladene Live-Daten stehen
     loadDemoData();
   }
+  Serial.printf("API: %s | live=%d | dep=%d arr=%d | Heap frei %u\n", lastApiStatus.c_str(), isLiveApiData, depCount, arrCount, ESP.getFreeHeap());
 }
 
 // ============================================================================
@@ -618,7 +622,7 @@ void drawBoard() {
 
   gfx->setTextColor(COL_AMBER);
   gfx->setCursor(20, 5);
-  gfx->print(apModeActive ? "WIFI SETUP" : (showDepartures ? "DEPARTURES" : "ARRIVALS"));
+  gfx->print(apModeActive ? "WIFI SETUP" : (millis() < infoUntilMs ? "CONNECTED" : (showDepartures ? "DEPARTURES" : "ARRIVALS")));
 
   // Uhrzeit exakt mittig zwischen Titel und Airport-Kenner (im Setup-Modus --:--)
   String clockStr = apModeActive ? "--:--" : getCurrentClockHHMM();
@@ -636,6 +640,28 @@ void drawBoard() {
   // Status-Punkt neben Airport-Kenner (Gruen = Live, Bernstein = Setup, Dim = Demo)
   uint16_t dotCol = apModeActive ? COL_AMBER : (isLiveApiData ? COL_GREEN : COL_DIM);
   gfx->fillCircle(249, 9, 3, dotCol);
+
+  // Infoschirm direkt nach dem Verbinden: zeigt, unter welcher Adresse die Einstellungen erreichbar sind
+  if (!apModeActive && millis() < infoUntilMs) {
+    const bool tall = cfg.matrixHeight >= 128;
+    const int lineH = tall ? 18 : 11;
+    int y = tall ? 26 : 22;
+    const int valX = 44;
+    String ip = WiFi.localIP().toString();
+    const char *labels[4] = {"WIFI", "IP", "WEB", "API"};
+    String values[4] = {cfg.wifiSsid, ip, "http://" + ip, lastApiStatus};
+    uint16_t colors[4] = {COL_CYAN, COL_GREEN, COL_GREEN, isLiveApiData ? COL_GREEN : COL_RED};
+    for (int i = 0; i < 4; i++) {
+      gfx->setTextColor(COL_AMBER);
+      gfx->setCursor(4, y);
+      gfx->print(labels[i]);
+      gfx->setTextColor(colors[i]);
+      gfx->setCursor(valX, y);
+      gfx->print(values[i].substring(0, (BOARD_SCREEN_W - valX) / 6));
+      y += lineH;
+    }
+    return;
+  }
 
   // Falls WLAN noch nicht konfiguriert ist: Hinweis im gleichen Tafel-Layout anzeigen
   if (apModeActive) {
@@ -661,7 +687,10 @@ void drawBoard() {
       gfx->print("WIFI");
       gfx->setTextColor(COL_CYAN);
       gfx->setCursor(52, 58);
-      gfx->print("AIRPORT-BOARD-SETUP");
+      gfx->print(AP_SSID);
+      gfx->setTextColor(COL_GREEN);
+      gfx->setCursor(52 + (int)strlen(AP_SSID) * 6 + 12, 58);
+      gfx->print(apIpStr);
       gfx->drawFastHLine(0, 71, BOARD_SCREEN_W, COL_LINE);
 
       gfx->setTextColor(COL_AMBER);
@@ -669,7 +698,7 @@ void drawBoard() {
       gfx->print("WEB");
       gfx->setTextColor(COL_GREEN);
       gfx->setCursor(52, 78);
-      gfx->print("http://192.168.4.1");
+      gfx->print("http://" + apIpStr);
       gfx->drawFastHLine(0, 91, BOARD_SCREEN_W, COL_LINE);
 
       gfx->setTextColor(COL_DIM);
@@ -687,7 +716,10 @@ void drawBoard() {
       gfx->print("WIFI");
       gfx->setTextColor(COL_CYAN);
       gfx->setCursor(40, 38);
-      gfx->print("AIRPORT-BOARD-SETUP");
+      gfx->print(AP_SSID);
+      gfx->setTextColor(COL_GREEN);
+      gfx->setCursor(40 + (int)strlen(AP_SSID) * 6 + 12, 38);
+      gfx->print(apIpStr);
       gfx->drawFastHLine(0, 49, BOARD_SCREEN_W, COL_LINE);
 
       gfx->setTextColor(COL_AMBER);
@@ -695,7 +727,7 @@ void drawBoard() {
       gfx->print("URL");
       gfx->setTextColor(COL_GREEN);
       gfx->setCursor(40, 53);
-      gfx->print("http://192.168.4.1");
+      gfx->print("http://" + apIpStr);
     }
     return;
   }
@@ -994,18 +1026,29 @@ void connectWifiOrStartAP() {
   if (WiFi.status() == WL_CONNECTED) {
     apModeActive = false;
     MDNS.begin("airportboard"); // Erreichbar unter http://airportboard.local
+    MDNS.addService("http", "tcp", 80);
+    Serial.printf("WLAN verbunden: %s  IP: %s\n", cfg.wifiSsid.c_str(), WiFi.localIP().toString().c_str());
     configTzTime(cfg.timezone.c_str(), "pool.ntp.org", "time.nist.gov");
   } else {
     // Fallback Access Point fuer Ersteinrichtung
     apModeActive = true;
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP("AIRPORT-BOARD-SETUP");
+    if (!WiFi.softAP(AP_SSID)) {
+      Serial.println("SoftAP konnte nicht gestartet werden (zu wenig RAM?)");
+    }
+    apIpStr = WiFi.softAPIP().toString();
+    Serial.printf("Setup-WLAN: %s  IP: %s\n", AP_SSID, apIpStr.c_str());
   }
 }
 
 void setup() {
   Serial.begin(115200);
   loadConfig();
+
+  // WLAN-Treiber zuerst initialisieren: Der DMA-Puffer der Matrix belegt sonst fast den
+  // gesamten internen RAM und esp_wifi_init scheitert mit ESP_ERR_NO_MEM
+  WiFi.mode(WIFI_STA);
+  Serial.printf("Freier Heap nach WLAN-Init: %u (groesster Block %u)\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
   // HUB75 / HUB75E Initialisierung: 1 Reihe (256x64) oder 2 Reihen (256x128) aus 64x64-Panels
   const int panelRows = cfg.matrixHeight / BOARD_PANEL_RES_Y;
@@ -1033,6 +1076,7 @@ void setup() {
   }
   dma_display->setBrightness8(cfg.brightness);
   dma_display->clearScreen();
+  Serial.printf("Freier Heap nach Display-Init: %u (groesster Block %u)\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
   gfx = new BoardDisplay(*dma_display, panelRows, BOARD_PANEL_COLS, BOARD_PANEL_RES_X, BOARD_PANEL_RES_Y);
 
@@ -1056,6 +1100,7 @@ void setup() {
 
   if (!apModeActive) {
     updateAllFlightData();
+    infoUntilMs = millis() + 20000UL;
   }
   renderMatrixDisplay();
 }
@@ -1065,8 +1110,15 @@ void loop() {
 
   unsigned long nowMs = millis();
 
+  if (infoUntilMs != 0 && nowMs >= infoUntilMs) {
+    infoUntilMs = 0;
+    lastSwitchMs = nowMs;
+    renderMatrixDisplay();
+  }
+  const bool infoActive = nowMs < infoUntilMs;
+
   // Automatischer Wechsel zwischen DEPARTURES und ARRIVALS
-  if (!apModeActive && (nowMs - lastSwitchMs >= (unsigned long)cfg.switchSeconds * 1000UL)) {
+  if (!infoActive && !apModeActive && (nowMs - lastSwitchMs >= (unsigned long)cfg.switchSeconds * 1000UL)) {
     lastSwitchMs = nowMs;
     showDepartures = !showDepartures;
     animFrame = 0;
