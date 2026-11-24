@@ -778,8 +778,43 @@ void drawPlaneIcon(int x, int y, bool takeoff, uint16_t color) {
   }
 }
 
+// Trennpunkt zwischen Flugnummern (Zeichen 0x07 ist in der GFX-Standardschrift ein Punkt)
+#define FLIGHT_DOT_STR "\x07"
+
+// "LH2071 . OS7241 . LX3611": operierende Airline zuerst, danach die Codeshare-Nummern
+String flightMarqueeText(const FlightEntry &f) {
+  String out = f.operatingFlight;
+  int start = 0;
+  const int len = f.allFlights.length();
+  while (start < len) {
+    while (start < len && f.allFlights[start] == ' ') start++;
+    int end = start;
+    while (end < len && f.allFlights[end] != ' ') end++;
+    if (end > start) {
+      String code = f.allFlights.substring(start, end);
+      if (code != f.operatingFlight) out += FLIGHT_DOT_STR + code;
+    }
+    start = end;
+  }
+  return out;
+}
+
+// Laufende Textfelder der aktuellen Seite: beim Scrollen werden nur diese neu gezeichnet,
+// ein komplettes Neuzeichnen alle 90 ms laesst die Matrix sichtbar flackern (kein Double-Buffering)
+struct AnimCell {
+  int x, y, maxW;
+  String text;
+  uint16_t color;
+  bool pauseAndReveal;
+  const char *loopGap;
+};
+#define MAX_ANIM_CELLS 14
+AnimCell animCells[MAX_ANIM_CELLS];
+int animCellCount = 0;
+bool replayingAnimCells = false;
+
 // Zeichnet Text innerhalb einer festen Pixelbox mit optionalem Scroll-Effekt
-void drawClippedCellText(int x, int y, int maxW, const String &text, uint16_t color, bool pauseAndReveal) {
+void drawClippedCellText(int x, int y, int maxW, const String &text, uint16_t color, bool pauseAndReveal, const char *loopGap = "   ") {
   int charW = 6; // Standard Adafruit GFX 5x7 Font = 6px pro Zeichen
   int textPx = text.length() * charW;
 
@@ -791,9 +826,11 @@ void drawClippedCellText(int x, int y, int maxW, const String &text, uint16_t co
   }
 
   animNeeded = true;
-
+  if (!replayingAnimCells && animCellCount < MAX_ANIM_CELLS) {
+    animCells[animCellCount++] = {x, y, maxW, text, color, pauseAndReveal, loopGap};
+  }
   int offsetPx = 0;
-  String loopStr = text + "   ";
+  String loopStr = text + loopGap;
   if (pauseAndReveal) {
     // Erst kurz statisch anzeigen, dann sanft bis zum Ende scrollen (z.B. PALMA DE MALLORCA)
     int overflow = textPx - maxW + 4;
@@ -832,11 +869,24 @@ void drawClippedCellText(int x, int y, int maxW, const String &text, uint16_t co
   }
 }
 
+// Zeichnet nur die laufenden Felder neu (naechster Scroll-Schritt), der Rest des Bildes bleibt stehen
+void renderAnimCellsOnly() {
+  if (!gfx) return;
+  replayingAnimCells = true;
+  for (int i = 0; i < animCellCount; i++) {
+    const AnimCell &c = animCells[i];
+    gfx->fillRect(c.x, c.y, c.maxW, 8, COL_BG);
+    drawClippedCellText(c.x, c.y, c.maxW, c.text, c.color, c.pauseAndReveal, c.loopGap);
+  }
+  replayingAnimCells = false;
+}
+
 void drawBoard() {
   gfx->fillScreen(COL_BG);
   gfx->setTextWrap(false);
   gfx->setTextSize(1);
   animNeeded = false;
+  animCellCount = 0;
 
   // --------------------------------------------------------------------------
   // 1. KOPFZEILE (0..18 px): Icon + Title | Uhrzeit (mittig) | IATA + Status-Dot
@@ -1039,11 +1089,17 @@ void drawBoard() {
     gfx->setCursor(2, textY);
     gfx->print(f.schedTime);
 
-    // FLIGHT (x=36, maxW=38px)
-    if (cfg.codeshareMarquee && f.allFlights.indexOf(' ') > 0) {
-      drawClippedCellText(36, textY, 38, f.allFlights, COL_WHITE, false);
+    // FLIGHT (x=36, maxW=38px): bei Codeshare ein weisser Punkt hinter der operierenden Airline
+    const bool hasCodeshare = f.allFlights.indexOf(' ') > 0;
+    if (cfg.codeshareMarquee && hasCodeshare) {
+      drawClippedCellText(36, textY, 38, flightMarqueeText(f), COL_WHITE, false, FLIGHT_DOT_STR);
     } else {
-      drawClippedCellText(36, textY, 38, f.operatingFlight, COL_WHITE, false);
+      gfx->setTextColor(COL_WHITE);
+      gfx->setCursor(36, textY);
+      gfx->print(f.operatingFlight);
+      if (hasCodeshare) {
+        gfx->fillRect(36 + (int)f.operatingFlight.length() * 6, textY + 2, 2, 2, COL_WHITE);
+      }
     }
 
     // DEST / FROM (x=78, maxW=82px - Pause & Scroll bei PALMA DE MALLORCA)
@@ -1390,10 +1446,14 @@ void loop() {
   if (nowMs - lastAnimMs >= 90) {
     lastAnimMs = nowMs;
     String clk = apModeActive ? String("") : getCurrentClockHHMM();
-    if (animNeeded || clk != lastClockStr) {
+    if (clk != lastClockStr) {
+      // Uhrzeit hat sich geaendert: einmal komplett neu zeichnen
       lastClockStr = clk;
       if (animNeeded) animFrame++;
       renderMatrixDisplay();
+    } else if (animNeeded) {
+      animFrame++;
+      renderAnimCellsOnly();
     }
   }
 }
