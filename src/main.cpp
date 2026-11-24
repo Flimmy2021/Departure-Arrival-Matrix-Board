@@ -130,6 +130,22 @@ struct FlightEntry {
 #define SHOW_LANDED_SEC 600     // gelandet: 10 min
 #define SHOW_CANCELLED_SEC 3600 // annulliert: 1 h
 #define MAX_FINISHED_ROWS 2     // gestartet/gelandet: hoechstens 2 Zeilen
+#define DELAYED_AFTER_SEC 900   // Abflug nicht gestartet, 15 min nach Plan: DELAYED
+#define STALE_DEPARTURE_SEC 7200 // nicht aktualisierte Abfluege nach 2 h ausblenden
+
+// Lokale Zeit eines AirLabs-Textes "YYYY-MM-DD HH:MM" (Flughafenzeit = eingestellte Zeitzone) als Unix-Zeit
+time_t parseLocalTs(const char *s) {
+  int y, mo, d, h, mi;
+  if (!s || sscanf(s, "%d-%d-%d %d:%d", &y, &mo, &d, &h, &mi) != 5) return 0;
+  struct tm t = {};
+  t.tm_year = y - 1900;
+  t.tm_mon = mo - 1;
+  t.tm_mday = d;
+  t.tm_hour = h;
+  t.tm_min = mi;
+  t.tm_isdst = -1;
+  return mktime(&t);
+}
 
 bool isTimeValid() {
   return time(nullptr) > 1700000000; // vor der NTP-Synchronisation liegt die Uhr bei 1970
@@ -365,7 +381,7 @@ bool fetchAirLabsEndpoint(bool isDeparture, FlightEntry *targetArr, int &targetC
   // _fields: nur die benoetigten Felder abrufen (Antwort wird ca. 3x kleiner, schont RAM und TLS-Verbindung)
   String url = "https://airlabs.co/api/v9/schedules?" + param + cfg.iataCode + "&api_key=" + key +
                "&_fields=flight_iata,cs_flight_iata,dep_iata,arr_iata,dep_gate,arr_gate,arr_baggage,dep_time,arr_time,"
-               "dep_estimated,arr_estimated,dep_time_ts,arr_time_ts,dep_actual_ts,arr_actual_ts,status,delayed,dep_delayed,arr_delayed";
+               "dep_estimated,arr_estimated,dep_actual,arr_actual,dep_time_ts,arr_time_ts,dep_actual_ts,arr_actual_ts,status,delayed,dep_delayed,arr_delayed";
 
   if (!http.begin(client, url)) {
     lastApiStatus = "HTTPS Verbindung fehlgeschlagen";
@@ -406,6 +422,8 @@ bool fetchAirLabsEndpoint(bool isDeparture, FlightEntry *targetArr, int &targetC
   fObj["dep_time_ts"] = true;
   fObj["arr_time_ts"] = true;
   fObj["dep_actual_ts"] = true;
+  fObj["dep_actual"] = true;
+  fObj["arr_actual"] = true;
   fObj["arr_actual_ts"] = true;
   fObj["status"] = true;
   fObj["delayed"] = true;
@@ -471,9 +489,13 @@ bool fetchAirLabsEndpoint(bool isDeparture, FlightEntry *targetArr, int &targetC
 
     time_t schedTs = isDeparture ? (item["dep_time_ts"] | 0L) : (item["arr_time_ts"] | 0L);
     time_t actualTs = isDeparture ? (item["dep_actual_ts"] | 0L) : (item["arr_actual_ts"] | 0L);
+    // Fehlen Unix-Zeitstempel in der Antwort, werden sie aus den lokalen Zeittexten berechnet
+    if (schedTs == 0) schedTs = parseLocalTs(item[isDeparture ? "dep_time" : "arr_time"].as<const char *>());
+    if (actualTs == 0) actualTs = parseLocalTs(item[isDeparture ? "dep_actual" : "arr_actual"].as<const char *>());
+    const time_t estTs = parseLocalTs(item[isDeparture ? "dep_estimated" : "arr_estimated"].as<const char *>());
     const bool cancelled = status == "cancelled";
     const bool done = !cancelled && (isDeparture ? (status == "active" || status == "landed" || actualTs > 0) : status == "landed");
-    const time_t eventTs = actualTs > 0 ? actualTs : schedTs;
+    const time_t eventTs = actualTs > 0 ? actualTs : (estTs > 0 ? estTs : schedTs);
 
     if (timeValid) {
       // Gestartet/gelandet/annulliert nur begrenzte Zeit nach dem Ereignis anzeigen
@@ -481,7 +503,7 @@ bool fetchAirLabsEndpoint(bool isDeparture, FlightEntry *targetArr, int &targetC
       if (done && eventTs > 0 && (now - eventTs > (isDeparture ? SHOW_DEPARTED_SEC : SHOW_LANDED_SEC))) continue;
       // Verspaetete, nicht aktualisierte Fluege nicht ewig stehen lassen
       if (!cancelled && !done && schedTs > 0) {
-        if (isDeparture && (now - schedTs > 1800) && status == "scheduled") continue;
+        if (isDeparture && (now - schedTs > STALE_DEPARTURE_SEC) && status == "scheduled") continue;
         if (!isDeparture && (now - schedTs > 2700) && status != "active") continue;
       }
     }
@@ -601,9 +623,103 @@ bool fetchAirLabsEndpoint(bool isDeparture, FlightEntry *targetArr, int &targetC
     }
   }
 
+  for (int i = 0; i < targetCount; i++) {
+    const FlightEntry &e = targetArr[i];
+    Serial.printf("  %s %s %-10s %-9s kind=%d sched=%ld event=%ld\n", e.schedTime.c_str(), e.operatingFlight.c_str(), e.cityName.c_str(),
+                  e.statusLabel.c_str(), e.kind, (long)e.sortTs, (long)e.eventTs);
+  }
   Serial.printf("AirLabs %s: %d Fluege empfangen, %d angezeigt, Uhrzeit gueltig=%d\n", isDeparture ? "dep" : "arr", itemsTotal, targetCount, timeValid);
   lastApiStatus = "Live OK (" + cfg.iataCode + ")";
   return true;
+}
+
+// Erkennt gestartete Abfluege ueber die Echtzeit-Flugdaten (/flights = Flugzeuge in der Luft).
+// Der Flugplan meldet "scheduled", obwohl die Maschine laengst abgehoben hat.
+struct SeenDeparture {
+  String flight;
+  time_t ts;
+};
+SeenDeparture seenDepartures[MAX_FLIGHTS];
+int seenDepartureNext = 0;
+
+void markAirborneDepartures() {
+  String key = cfg.apiKey;
+  key.trim();
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.setTimeout(10000);
+  String url = "https://airlabs.co/api/v9/flights?dep_iata=" + cfg.iataCode + "&api_key=" + key + "&_fields=flight_iata,cs_flight_iata";
+  if (!http.begin(client, url) || http.GET() != HTTP_CODE_OK) {
+    Serial.println("AirLabs flights: Abruf fehlgeschlagen, Start-Erkennung uebersprungen");
+    http.end();
+    return;
+  }
+
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+  JsonDocument filter;
+  JsonDocument doc;
+#else
+  StaticJsonDocument<128> filter;
+  DynamicJsonDocument doc(8192);
+#endif
+  JsonObject fObj = filter["response"][0].to<JsonObject>();
+  fObj["flight_iata"] = true;
+  fObj["cs_flight_iata"] = true;
+  WaitingStream body(http.getStream());
+  DeserializationError err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
+  http.end();
+  if (err) {
+    Serial.printf("AirLabs flights: JSON %s\n", err.c_str());
+    return;
+  }
+
+  // Flugnummern der Maschinen in der Luft als ",LH123,AB45," ablegen
+  String airborne = ",";
+  for (JsonObject f : doc["response"].as<JsonArray>()) {
+    const char *a = f["flight_iata"].as<const char *>();
+    const char *b = f["cs_flight_iata"].as<const char *>();
+    if (a && *a) airborne += String(a) + ",";
+    if (b && *b) airborne += String(b) + ",";
+  }
+
+  const time_t now = time(nullptr);
+  int marked = 0;
+  for (int i = 0; i < depCount; i++) {
+    FlightEntry &e = depFlights[i];
+    if (e.kind != 0) continue;
+    if (airborne.indexOf("," + e.operatingFlight + ",") < 0) {
+      // Auch Codeshare-Nummern pruefen (allFlights = "LH1  OS2  LX3")
+      bool hit = false;
+      int start = 0;
+      while (start < (int)e.allFlights.length() && !hit) {
+        int sp = e.allFlights.indexOf(' ', start);
+        String code = e.allFlights.substring(start, sp < 0 ? e.allFlights.length() : sp);
+        if (code.length() > 0 && airborne.indexOf("," + code + ",") >= 0) hit = true;
+        start = sp < 0 ? e.allFlights.length() : sp + 1;
+      }
+      if (!hit) continue;
+    }
+
+    // Erste Erkennung merken, damit die 5-Minuten-Anzeigedauer nicht bei jedem Abruf neu beginnt
+    time_t ts = 0;
+    for (int s = 0; s < MAX_FLIGHTS; s++) {
+      if (seenDepartures[s].flight == e.operatingFlight && seenDepartures[s].ts > 0) ts = seenDepartures[s].ts;
+    }
+    if (ts == 0) {
+      ts = (e.sortTs > 0 && now > e.sortTs + 900) ? e.sortTs + 900 : now;
+      seenDepartures[seenDepartureNext] = {e.operatingFlight, ts};
+      seenDepartureNext = (seenDepartureNext + 1) % MAX_FLIGHTS;
+    }
+    e.kind = 1;
+    e.eventTs = ts;
+    e.statusLabel = "DEPARTED";
+    e.statusColor = COL_CYAN;
+    marked++;
+  }
+  Serial.printf("AirLabs flights: %d Maschinen in der Luft, %d Abfluege als gestartet erkannt\n", (int)doc["response"].size(), marked);
 }
 
 void updateAllFlightData() {
@@ -627,6 +743,8 @@ void updateAllFlightData() {
     if (!okDep) okDep = fetchAirLabsEndpoint(true, depFlights, depCount);
     if (!okArr) okArr = fetchAirLabsEndpoint(false, arrFlights, arrCount);
   }
+
+  if (okDep) markAirborneDepartures();
 
   if (okDep && okArr) {
     isLiveApiData = true;
@@ -932,17 +1050,25 @@ void drawBoard() {
     drawClippedCellText(78, textY, 82, f.cityName, COL_AMBER, true);
 
     // GATE / BELT (x=164, linksbuendig)
-    gfx->setTextColor(f.isBaggageBelt ? COL_BELT : COL_CYAN);
+    // Abflug-Gates haben dieselbe Farbe wie die Gepaeckbaender der Ankunftstafel
+    gfx->setTextColor((showDepartures || f.isBaggageBelt) ? COL_BELT : COL_CYAN);
     gfx->setCursor(164, textY);
     gfx->print(f.gateOrBelt);
 
     // STATUS (rechtsbuendig bis x=255, genuegend Platz fuer 9 Zeichen wie CANCELLED)
-    int stWidth = (int)f.statusLabel.length() * 6;
+    String statusText = f.statusLabel;
+    uint16_t statusCol = f.statusColor;
+    // Abflug nicht gestartet und 15 min nach der geplanten Zeit: DELAYED (ersetzt ON TIME/EST)
+    if (showDepartures && f.kind == 0 && timeValid && f.sortTs > 0 && (nowTs - f.sortTs) > DELAYED_AFTER_SEC) {
+      statusText = "DELAYED";
+      statusCol = COL_AMBER;
+    }
+    int stWidth = (int)statusText.length() * 6;
     int stX = 255 - stWidth;
     if (stX < 192) stX = 192;
-    gfx->setTextColor(f.statusColor);
+    gfx->setTextColor(statusCol);
     gfx->setCursor(stX, textY);
-    gfx->print(f.statusLabel);
+    gfx->print(statusText);
 
     // Dezente Trennlinie
     if (i < visible - 1) {
