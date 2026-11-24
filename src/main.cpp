@@ -133,6 +133,11 @@ struct FlightEntry {
 #define DELAYED_AFTER_SEC 900   // Abflug nicht gestartet, 15 min nach Plan: DELAYED
 #define STALE_DEPARTURE_SEC 7200 // nicht aktualisierte Abfluege nach 2 h ausblenden
 
+// Codeshare-Rotation: Anzahl Frames fuer Pause (statische Anzeige) und Slide-Transition
+// Jeder Frame = 90 ms  →  50 Frames ≈ 4,5 s Pause,  22 Frames ≈ 2 s Slide
+#define CS_PAUSE_FRAMES  50
+#define CS_SCROLL_FRAMES 22
+
 // Lokale Zeit eines AirLabs-Textes "YYYY-MM-DD HH:MM" (Flughafenzeit = eingestellte Zeitzone) als Unix-Zeit
 time_t parseLocalTs(const char *s) {
   int y, mo, d, h, mi;
@@ -813,6 +818,17 @@ AnimCell animCells[MAX_ANIM_CELLS];
 int animCellCount = 0;
 bool replayingAnimCells = false;
 
+// Slide-Animationszellen fuer Codeshare-Nummern (separates Array, da State animFrame-basiert ist)
+struct CodeshareAnimCell {
+  int x, y, maxW;
+  String tokens[6]; // operierender Carrier zuerst, dann Codeshare-Partner
+  int tokenCount;
+  uint16_t color;
+};
+#define MAX_CS_ANIM_CELLS 7
+CodeshareAnimCell csAnimCells[MAX_CS_ANIM_CELLS];
+int csAnimCellCount = 0;
+
 // Zeichnet Text innerhalb einer festen Pixelbox mit optionalem Scroll-Effekt
 void drawClippedCellText(int x, int y, int maxW, const String &text, uint16_t color, bool pauseAndReveal, const char *loopGap = "   ") {
   int charW = 6; // Standard Adafruit GFX 5x7 Font = 6px pro Zeichen
@@ -869,6 +885,92 @@ void drawClippedCellText(int x, int y, int maxW, const String &text, uint16_t co
   }
 }
 
+// --- Codeshare-Slide-Animation ---------------------------------------------------
+
+// Hilfsfunktion: zeichnet String s ab xStart mit pixelgenauem Clipping in [cellX..cellX+cellMaxW)
+static void drawCodeshareToken(int xStart, int cellX, int cellY, int cellMaxW,
+                               const String &s, uint16_t color) {
+  const int charW = 6;
+  for (int i = 0; i < (int)s.length(); i++) {
+    int cx = xStart + i * charW;
+    if (cx + charW - 1 >= cellX && cx < cellX + cellMaxW) {
+      gfx->drawChar(cx, cellY, s[i], color, COL_BG, 1);
+    }
+  }
+}
+
+// Zeichnet eine Codeshare-Animationszelle neu (wird sowohl aus drawBoard als auch
+// aus renderAnimCellsOnly aufgerufen, damit nur diese Spalte neu gezeichnet wird).
+void drawCodeshareAnimCell(const CodeshareAnimCell &cell) {
+  const int charW = 6;
+  int phaseLen  = CS_PAUSE_FRAMES + CS_SCROLL_FRAMES;
+  int cycleLen  = cell.tokenCount * phaseLen;
+  int frame     = (int)(animFrame % (uint32_t)cycleLen);
+  int tokenIdx  = frame / phaseLen;
+  int phaseFrame = frame % phaseLen;
+  int nextIdx   = (tokenIdx + 1) % cell.tokenCount;
+
+  // Zelle vorher loeschen (kein Flackern, da CPU viel schneller als DMA-Scan)
+  gfx->fillRect(cell.x, cell.y, cell.maxW, 8, COL_BG);
+
+  if (phaseFrame < CS_PAUSE_FRAMES) {
+    // Statische Anzeige der aktuellen Flugnummer
+    gfx->setTextColor(cell.color);
+    gfx->setCursor(cell.x, cell.y);
+    gfx->print(cell.tokens[tokenIdx]);
+  } else {
+    // Slide-Transition: aktuelle Nummer gleitet pixelweise links raus,
+    // naechste kommt von rechts rein
+    int scrollFrame = phaseFrame - CS_PAUSE_FRAMES;
+    // Scroll-Distanz = Breite des aktuellen Textes + 10 px Luecke
+    int scrollDist = (int)cell.tokens[tokenIdx].length() * charW + 10;
+    // Lineare Interpolation 0..scrollDist ueber CS_SCROLL_FRAMES Frames
+    int offsetPx = (scrollFrame * scrollDist) / CS_SCROLL_FRAMES;
+
+    drawCodeshareToken(cell.x - offsetPx,              cell.x, cell.y, cell.maxW,
+                       cell.tokens[tokenIdx], cell.color);
+    drawCodeshareToken(cell.x + scrollDist - offsetPx, cell.x, cell.y, cell.maxW,
+                       cell.tokens[nextIdx],  cell.color);
+  }
+}
+
+// Wird aus drawBoard heraus aufgerufen; baut Token-Liste auf und registriert die Zelle.
+void drawCodeshareAnim(int x, int y, int maxW, const FlightEntry &f, uint16_t color) {
+  animNeeded = true;
+
+  CodeshareAnimCell cell;
+  cell.x = x; cell.y = y; cell.maxW = maxW; cell.color = color;
+  cell.tokenCount = 0;
+
+  // Operierender Carrier immer an erster Stelle
+  cell.tokens[cell.tokenCount++] = f.operatingFlight;
+
+  // Restliche Nummern aus allFlights (leerzeichengetrennt) hinzufuegen
+  int start = 0;
+  const String &af = f.allFlights;
+  while (start < (int)af.length() && cell.tokenCount < 6) {
+    while (start < (int)af.length() && af[start] == ' ') start++;
+    int end = start;
+    while (end < (int)af.length() && af[end] != ' ') end++;
+    if (end > start) {
+      String code = af.substring(start, end);
+      if (code != f.operatingFlight) {
+        cell.tokens[cell.tokenCount++] = code;
+      }
+    }
+    start = end;
+  }
+
+  // Zelle registrieren (nicht im Replay-Modus, um Doppeleintrag zu vermeiden)
+  if (!replayingAnimCells && csAnimCellCount < MAX_CS_ANIM_CELLS) {
+    csAnimCells[csAnimCellCount++] = cell;
+  }
+
+  drawCodeshareAnimCell(cell);
+}
+
+// ---------------------------------------------------------------------------------
+
 // Zeichnet nur die laufenden Felder neu (naechster Scroll-Schritt), der Rest des Bildes bleibt stehen
 void renderAnimCellsOnly() {
   if (!gfx) return;
@@ -877,6 +979,10 @@ void renderAnimCellsOnly() {
     const AnimCell &c = animCells[i];
     gfx->fillRect(c.x, c.y, c.maxW, 8, COL_BG);
     drawClippedCellText(c.x, c.y, c.maxW, c.text, c.color, c.pauseAndReveal, c.loopGap);
+  }
+  // Codeshare-Slide-Zellen separat aktualisieren
+  for (int i = 0; i < csAnimCellCount; i++) {
+    drawCodeshareAnimCell(csAnimCells[i]);
   }
   replayingAnimCells = false;
 }
@@ -887,6 +993,7 @@ void drawBoard() {
   gfx->setTextSize(1);
   animNeeded = false;
   animCellCount = 0;
+  csAnimCellCount = 0;
 
   // --------------------------------------------------------------------------
   // 1. KOPFZEILE (0..18 px): Icon + Title | Uhrzeit (mittig) | IATA + Status-Dot
@@ -1092,7 +1199,8 @@ void drawBoard() {
     // FLIGHT (x=36, maxW=38px): bei Codeshare ein weisser Punkt hinter der operierenden Airline
     const bool hasCodeshare = f.allFlights.indexOf(' ') > 0;
     if (cfg.codeshareMarquee && hasCodeshare) {
-      drawClippedCellText(36, textY, 38, flightMarqueeText(f), COL_WHITE, false, FLIGHT_DOT_STR);
+      // Neue Slide-Animation: Hauptflug anzeigen, dann Codeshare-Nummern einzeln einblenden
+      drawCodeshareAnim(36, textY, 38, f, COL_WHITE);
     } else {
       gfx->setTextColor(COL_WHITE);
       gfx->setCursor(36, textY);
