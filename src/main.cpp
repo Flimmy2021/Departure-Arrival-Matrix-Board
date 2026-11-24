@@ -3,9 +3,8 @@
   ESP32 HUB75 / HUB75E LED MATRIX AIRPORT DEPARTURE & ARRIVAL BOARD (HAM)
   ============================================================================
   Hardware
-   - ESP32 / ESP32-S3 (empfohlen ESP32-S3 mit PSRAM fuer 256x128 Double-Buffering)
-   - HUB75 / HUB75E LED Matrix Panels (8x 64x64 = 2 Reihen a 4 Panels = 256x128,
-     oder 4x 64x64 = 256x64)
+   - ESP32 (esp32dev)
+   - 2x HUB75E LED Matrix Panels 128x64 nebeneinander = 256x64 (3 Flugzeilen)
 
   Benoetigte Bibliotheken (siehe platformio.ini)
    1. ESP32 HUB75 LED MATRIX PANEL DMA Display (mrfaptastic)
@@ -44,14 +43,14 @@ static const char *API_KEY_PLACEHOLDER = "DEIN_AIRLABS_API_KEY_HIER";
 // ============================================================================
 // 2. HUB75 / HUB75E PANEL KONFIGURATION
 // ============================================================================
-#define BOARD_PANEL_RES_X 64
-#define BOARD_PANEL_RES_Y 64
-#define BOARD_PANEL_COLS 4 // 4 * 64 = 256 Pixel Breite
-#define BOARD_SCREEN_W (BOARD_PANEL_RES_X * BOARD_PANEL_COLS)
+#define BOARD_PANEL_RES_X 128 // Breite eines einzelnen Panels
+#define BOARD_PANEL_RES_Y 64  // Hoehe eines einzelnen Panels
+#define BOARD_PANEL_COLS 2    // 2 Panels nebeneinander
+#define BOARD_PANEL_ROWS 1
+#define BOARD_SCREEN_W (BOARD_PANEL_RES_X * BOARD_PANEL_COLS)  // 256
+#define BOARD_SCREEN_H (BOARD_PANEL_RES_Y * BOARD_PANEL_ROWS)  // 64
 
-// Verkettung der Panels bei 2 Reihen (256x128). Bei einer Reihe spielt der Wert keine Rolle.
-// CHAIN_TOP_LEFT_DOWN = Serpentine (untere Reihe ueber Kopf verkabelt),
-// CHAIN_TOP_LEFT_DOWN_ZZ = Zickzack (alle Panels aufrecht, lange Kabel zurueck)
+// Bei einer Reihe ohne Bedeutung, wird nur vom VirtualMatrixPanel gebraucht
 #define BOARD_CHAIN_TYPE CHAIN_TOP_LEFT_DOWN
 
 // 1 = Double-Buffering (flackerfrei, braucht viel DMA-RAM -> nur ESP32-S3 empfohlen)
@@ -135,6 +134,7 @@ bool showDepartures = true;
 bool isLiveApiData = false;
 bool apModeActive = false;
 bool animNeeded = false; // wird beim Rendern gesetzt, wenn ein Text scrollen muss
+bool refreshRequested = false; // vom Web-Interface gesetzt, loop() ruft dann die API ab
 String lastApiStatus = "Initialisiere...";
 unsigned long infoUntilMs = 0; // solange millis() darunter liegt, zeigt das Display den Verbindungs-Infoschirm
 String lastClockStr = "";
@@ -198,7 +198,7 @@ void loadConfig() {
   cfg.wifiPass = prefs.getString("pass", "");
   cfg.apiKey = prefs.getString("api_key", AIRLABS_API_KEY);
   cfg.iataCode = prefs.getString("iata", "HAM");
-  cfg.matrixHeight = prefs.getInt("height", 128);
+  cfg.matrixHeight = BOARD_SCREEN_H; // feste Hardware: 256x64
   cfg.switchSeconds = prefs.getInt("sw_sec", 15);
   cfg.pollMinutes = prefs.getInt("poll_min", 10);
   cfg.brightness = prefs.getInt("bright", 90);
@@ -206,7 +206,6 @@ void loadConfig() {
   cfg.timezone = prefs.getString("tz", "CET-1CEST,M3.5.0,M10.5.0/3");
   prefs.end();
 
-  if (cfg.matrixHeight != 64) cfg.matrixHeight = 128;
 }
 
 void saveConfig() {
@@ -215,7 +214,6 @@ void saveConfig() {
   prefs.putString("pass", cfg.wifiPass);
   prefs.putString("api_key", cfg.apiKey);
   prefs.putString("iata", cfg.iataCode);
-  prefs.putInt("height", cfg.matrixHeight);
   prefs.putInt("sw_sec", cfg.switchSeconds);
   prefs.putInt("poll_min", cfg.pollMinutes);
   prefs.putInt("bright", cfg.brightness);
@@ -293,6 +291,44 @@ void loadDemoData() {
 // ============================================================================
 // 8. AIRLABS API ABRUFEN & PARSEN (INKL. 5-MIN-REGEL & CODESHARE-GRUPPIERUNG)
 // ============================================================================
+// Stream-Adapter fuer ArduinoJson: wartet auf Daten, solange die TLS-Verbindung offen ist.
+// Client::read() liefert sonst bei kurzen Luecken im Datenstrom -1, was der Parser als Ende wertet.
+class WaitingStream : public Stream {
+ public:
+  explicit WaitingStream(Client &c) : client_(c) {}
+  uint32_t bytesRead = 0;
+
+  int available() override { return client_.available(); }
+  int read() override {
+    if (!waitForData()) return -1;
+    bytesRead++;
+    return client_.read();
+  }
+  int peek() override { return waitForData() ? client_.peek() : -1; }
+  size_t readBytes(char *buffer, size_t length) override {
+    size_t n = 0;
+    while (n < length) {
+      int c = read();
+      if (c < 0) break;
+      buffer[n++] = (char)c;
+    }
+    return n;
+  }
+  size_t write(uint8_t) override { return 0; }
+  void flush() override {}
+
+ private:
+  bool waitForData() {
+    unsigned long start = millis();
+    while (client_.available() == 0) {
+      if (!client_.connected() || millis() - start > 10000) return false;
+      delay(1);
+    }
+    return true;
+  }
+  Client &client_;
+};
+
 bool fetchAirLabsEndpoint(bool isDeparture, FlightEntry *targetArr, int &targetCount) {
   String key = cfg.apiKey;
   key.trim();
@@ -308,16 +344,25 @@ bool fetchAirLabsEndpoint(bool isDeparture, FlightEntry *targetArr, int &targetC
   http.useHTTP10(true); // verhindert Chunked-Encoding, das den Stream-Parser stoeren wuerde
   http.setTimeout(10000);
   String param = isDeparture ? "dep_iata=" : "arr_iata=";
-  String url = "https://airlabs.co/api/v9/schedules?" + param + cfg.iataCode + "&api_key=" + key;
+  // _fields: nur die benoetigten Felder abrufen (Antwort wird ca. 3x kleiner, schont RAM und TLS-Verbindung)
+  String url = "https://airlabs.co/api/v9/schedules?" + param + cfg.iataCode + "&api_key=" + key +
+               "&_fields=flight_iata,cs_flight_iata,dep_iata,arr_iata,dep_gate,arr_gate,arr_baggage,dep_time,arr_time,"
+               "dep_estimated,arr_estimated,dep_time_ts,arr_time_ts,dep_actual_ts,arr_actual_ts,status,delayed,dep_delayed,arr_delayed";
 
   if (!http.begin(client, url)) {
     lastApiStatus = "HTTPS Verbindung fehlgeschlagen";
     return false;
   }
 
+  unsigned long t0 = millis();
+  Serial.printf("AirLabs %s: Abruf startet, Heap frei %u, groesster Block %u\n", isDeparture ? "dep" : "arr", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   int httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK) {
-    lastApiStatus = "HTTP Fehler " + String(httpCode);
+    char tlsErr[80] = "";
+    client.lastError(tlsErr, sizeof(tlsErr));
+    lastApiStatus = "HTTP Fehler " + String(httpCode) + " (" + HTTPClient::errorToString(httpCode) + ")";
+    Serial.printf("AirLabs %s: %s | TLS: %s | Heap frei %u, groesster Block %u\n", isDeparture ? "dep" : "arr", lastApiStatus.c_str(), tlsErr,
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     http.end();
     return false;
   }
@@ -348,14 +393,36 @@ bool fetchAirLabsEndpoint(bool isDeparture, FlightEntry *targetArr, int &targetC
   fObj["delayed"] = true;
   fObj["dep_delayed"] = true;
   fObj["arr_delayed"] = true;
+  filter["error"]["message"] = true;
 
 #if ARDUINOJSON_VERSION_MAJOR >= 7
   JsonDocument doc;
 #else
   DynamicJsonDocument doc(24576);
 #endif
-  DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  // Kleine Antworten (z.B. Fehlermeldungen) komplett lesen, grosse Flugplaene als Stream parsen
+  DeserializationError err;
+  int bodyLen = http.getSize();
+  uint32_t streamedBytes = 0;
+  if (bodyLen > 0 && bodyLen < 4096) {
+    String body = http.getString();
+    err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
+  } else {
+    WaitingStream body(http.getStream());
+    err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
+    streamedBytes = body.bytesRead;
+  }
+  char tlsErr[80] = "";
+  client.lastError(tlsErr, sizeof(tlsErr));
   http.end();
+  Serial.printf("AirLabs %s: HTTP %d, Content-Length %d, gelesen %u in %lu ms, JSON: %s, TLS: %s\n", isDeparture ? "dep" : "arr", httpCode, bodyLen,
+                (unsigned)streamedBytes, millis() - t0, err.c_str(), tlsErr);
+
+  const char *apiError = doc["error"]["message"] | static_cast<const char *>(nullptr);
+  if (apiError) {
+    lastApiStatus = String("AirLabs: ") + apiError;
+    return false;
+  }
 
   if (err) {
     lastApiStatus = "JSON Parse Fehler " + String(err.c_str());
@@ -875,30 +942,23 @@ String buildHtmlPage(const String &scannedOptions, const String &bannerMsg = "")
           <input type="text" id="iata" name="iata" maxlength="3" value=")rawliteral" + htmlEscape(cfg.iataCode) + R"rawliteral(">
         </div>
         <div>
-          <label for="height">Matrix Auflösung</label>
-          <select id="height" name="height">
-            <option value="128" )rawliteral" + String(cfg.matrixHeight == 128 ? "selected" : "") + R"rawliteral(>256x128 (7 Zeilen)</option>
-            <option value="64" )rawliteral" + String(cfg.matrixHeight == 64 ? "selected" : "") + R"rawliteral(>256x64 (3 Zeilen)</option>
-          </select>
+          <label for="sw_sec">Wechsel Abflug/Ankunft (Sek.)</label>
+          <input type="number" id="sw_sec" name="sw_sec" min="4" max="120" value=")rawliteral" + String(cfg.switchSeconds) + R"rawliteral(">
         </div>
       </div>
 
       <div class="row">
-        <div>
-          <label for="sw_sec">Wechsel Abflug/Ankunft (Sek.)</label>
-          <input type="number" id="sw_sec" name="sw_sec" min="4" max="120" value=")rawliteral" + String(cfg.switchSeconds) + R"rawliteral(">
-        </div>
         <div>
           <label for="poll_min">API Update (Min.)</label>
           <input type="number" id="poll_min" name="poll_min" min="2" max="60" value=")rawliteral" + String(cfg.pollMinutes) + R"rawliteral(">
         </div>
-      </div>
-
-      <div class="row">
         <div>
           <label for="bright">LED Helligkeit (10-255)</label>
           <input type="number" id="bright" name="bright" min="10" max="255" value=")rawliteral" + String(cfg.brightness) + R"rawliteral(">
         </div>
+      </div>
+
+      <div class="row">
         <div>
           <label for="cs_marq">Codeshare-Anzeige</label>
           <select id="cs_marq" name="cs_marq">
@@ -977,14 +1037,6 @@ void setupWebServer() {
       iata.toUpperCase();
       if (isAlpha(iata[0]) && isAlpha(iata[1]) && isAlpha(iata[2])) cfg.iataCode = iata;
     }
-    if (server.hasArg("height")) {
-      // Die Panel-Anordnung wird beim Start festgelegt -> Neustart noetig
-      int newHeight = server.arg("height").toInt() == 64 ? 64 : 128;
-      if (newHeight != cfg.matrixHeight) {
-        cfg.matrixHeight = newHeight;
-        needsRestart = true;
-      }
-    }
     if (server.hasArg("sw_sec")) cfg.switchSeconds = constrain(server.arg("sw_sec").toInt(), 4, 120);
     if (server.hasArg("poll_min")) cfg.pollMinutes = constrain(server.arg("poll_min").toInt(), 2, 60);
     if (server.hasArg("bright")) {
@@ -1000,10 +1052,11 @@ void setupWebServer() {
       delay(1500);
       ESP.restart();
     } else {
-      updateAllFlightData();
-      renderMatrixDisplay();
+      // Abruf erst nach der Antwort in loop() ausfuehren: im Request ist der Heap fuer TLS oft zu knapp/fragmentiert
+      refreshRequested = true;
       String options = scanWifiDropdownOptions();
-      server.send(200, "text/html", buildHtmlPage(options, "Einstellungen erfolgreich gespeichert und aktualisiert!"));
+      server.send(200, "text/html",
+                  buildHtmlPage(options, "Einstellungen gespeichert. Flugdaten werden jetzt neu geladen - Seite in ca. 20 Sekunden neu laden, dann zeigt der Status unten das Ergebnis."));
     }
   });
 
@@ -1043,6 +1096,7 @@ void connectWifiOrStartAP() {
 
 void setup() {
   Serial.begin(115200);
+  Serial.printf("\nStart, Reset-Grund: %d (1=Power-on 3=Software 4=Panic 5/6/7=Watchdog 9=Brownout)\n", (int)esp_reset_reason());
   loadConfig();
 
   // WLAN-Treiber zuerst initialisieren: Der DMA-Puffer der Matrix belegt sonst fast den
@@ -1050,9 +1104,8 @@ void setup() {
   WiFi.mode(WIFI_STA);
   Serial.printf("Freier Heap nach WLAN-Init: %u (groesster Block %u)\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
-  // HUB75 / HUB75E Initialisierung: 1 Reihe (256x64) oder 2 Reihen (256x128) aus 64x64-Panels
-  const int panelRows = cfg.matrixHeight / BOARD_PANEL_RES_Y;
-  HUB75_I2S_CFG mxconfig(BOARD_PANEL_RES_X, BOARD_PANEL_RES_Y, panelRows * BOARD_PANEL_COLS);
+  // HUB75 / HUB75E Initialisierung: 2 Panels 128x64 nebeneinander = 256x64
+  HUB75_I2S_CFG mxconfig(BOARD_PANEL_RES_X, BOARD_PANEL_RES_Y, BOARD_PANEL_COLS);
   mxconfig.gpio.r1 = BOARD_R1_PIN;
   mxconfig.gpio.g1 = BOARD_G1_PIN;
   mxconfig.gpio.b1 = BOARD_B1_PIN;
@@ -1070,6 +1123,7 @@ void setup() {
   mxconfig.clkphase = false;
   mxconfig.double_buff = BOARD_DOUBLE_BUFFER;
 
+  Serial.println("Display-Init startet...");
   dma_display = new MatrixPanel_I2S_DMA(mxconfig);
   if (!dma_display->begin()) {
     Serial.println("HUB75 DMA Init fehlgeschlagen (zu wenig RAM?)");
@@ -1078,7 +1132,7 @@ void setup() {
   dma_display->clearScreen();
   Serial.printf("Freier Heap nach Display-Init: %u (groesster Block %u)\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
-  gfx = new BoardDisplay(*dma_display, panelRows, BOARD_PANEL_COLS, BOARD_PANEL_RES_X, BOARD_PANEL_RES_Y);
+  gfx = new BoardDisplay(*dma_display, BOARD_PANEL_ROWS, BOARD_PANEL_COLS, BOARD_PANEL_RES_X, BOARD_PANEL_RES_Y);
 
   // Farben initialisieren
   COL_BG = gfx->color565(0, 0, 0);
@@ -1126,7 +1180,8 @@ void loop() {
   }
 
   // Regelmaessiger AirLabs API Abruf
-  if (!apModeActive && (nowMs - lastPollMs >= (unsigned long)cfg.pollMinutes * 60000UL)) {
+  if (!apModeActive && (refreshRequested || nowMs - lastPollMs >= (unsigned long)cfg.pollMinutes * 60000UL)) {
+    refreshRequested = false;
     lastPollMs = nowMs;
     updateAllFlightData();
     renderMatrixDisplay();

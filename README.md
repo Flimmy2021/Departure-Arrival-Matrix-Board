@@ -5,10 +5,9 @@ Die Flugdaten kommen live von der [AirLabs](https://airlabs.co) Schedules-API; o
 
 ## Hardware
 
-- ESP32 (oder ESP32-S3)
-- 8x HUB75E-Panels 64x64 (2 Reihen à 4 Panels = 256x128) oder 4x 64x64 (256x64)
+- ESP32 (esp32dev)
+- 2x HUB75E-Panels 128x64 nebeneinander = 256x64 (3 Flugzeilen)
 - Pinbelegung: siehe `BOARD_*_PIN` in [src/main.cpp](src/main.cpp)
-- Verkettung der zwei Reihen über `BOARD_CHAIN_TYPE` einstellbar (Serpentine oder Zickzack)
 
 ## Einrichtung
 
@@ -17,7 +16,7 @@ Die Flugdaten kommen live von der [AirLabs](https://airlabs.co) Schedules-API; o
    - `include/secrets.example.h` nach `include/secrets.h` kopieren und den Key eintragen (wird nicht eingecheckt), oder
    - später im Web-Interface eintragen.
 3. Beim ersten Start öffnet das Board das WLAN `AIRPORT-BOARD-SETUP`. Verbinden und `http://192.168.4.1` aufrufen.
-4. Im Web-Interface WLAN, Flughafen (IATA), Matrix-Auflösung, Wechselzeit, Helligkeit usw. einstellen.
+4. Im Web-Interface WLAN, Flughafen (IATA), Wechselzeit, Helligkeit usw. einstellen.
    Danach ist das Board unter `http://airportboard.local` erreichbar.
 
 ## Projektstruktur
