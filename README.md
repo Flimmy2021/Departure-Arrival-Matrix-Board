@@ -6,7 +6,7 @@ Die Flugdaten kommen live von der [AirLabs](https://airlabs.co) Schedules-API; o
 ## Hardware
 
 - ESP32 (esp32dev)
-- 2x HUB75E-Panels 128x64 nebeneinander = 256x64 (3 Flugzeilen)
+- 4x HUB75E-Panels 128x64 als U (2 Spalten × 2 Reihen, untere Reihe kopfüber) = 256x128 (7 Flugzeilen)
 - Pinbelegung: siehe `BOARD_*_PIN` in [src/main.cpp](src/main.cpp)
 
 ## Einrichtung

@@ -21,23 +21,14 @@ auf einer kaskadierenden HUB75E-LED-Matrix anzeigt. Die Flugdaten kommen live vo
 | Komponente | Details |
 |---|---|
 | Mikrocontroller | ESP32 (`esp32dev`) |
-| Displays | **2× HUB75E LED-Matrix-Panel, je 128×64 Pixel**, in Reihe geschaltet |
-| Gesamtauflösung | **256×64 Pixel** (2 Panels nebeneinander, 1 Reihe) |
-| Sichtbare Flugzeilen | 3 Einträge gleichzeitig |
-
-### Geplanter Aufbau (zukünftig)
-Zwei weitere Panels sollen darunter in Reihe hinzukommen:
-| Erweiterung | Details |
-|---|---|
-| Displays gesamt | 4× HUB75E-Panel (je 128×64 px) |
-| Anordnung | 2 Spalten × 2 Reihen |
+| Displays | **4× HUB75E LED-Matrix-Panel, je 128×64 Pixel** |
+| Anordnung | **2 Spalten × 2 Reihen**, U-Kette (`CHAIN_TOP_LEFT_DOWN`): oben links→rechts aufrecht, unten kopfüber rechts→links |
 | Gesamtauflösung | **256×128 Pixel** |
 | Sichtbare Flugzeilen | 7 Einträge gleichzeitig |
 
-> **Wichtig für KI-Agenten:** Der Code unterstützt bereits `cfg.matrixHeight >= 128` (Pfade im Rendering)
-> und schaltet dann auf 7 Zeilen, Spaltenköpfe (TIME / FLIGHT / DEST oder FROM / GATE oder BELT / STATUS)
-> und das erweiterte Setup-Layout um. Die 256×128-Erweiterung ist also weitgehend vorbereitet —
-> es fehlen nur die angepassten Panel-Konstanten und Hardware.
+> **Wichtig für KI-Agenten:** `cfg.matrixHeight` kommt aus `BOARD_SCREEN_H` (128). Damit sind Spaltenköpfe
+> (TIME / FLIGHT / DEST oder FROM / GATE oder BELT / STATUS), 7 Flugzeilen und das hohe Setup-Layout aktiv.
+> Die DMA-Kette hat `BOARD_PANEL_CHAIN` = 4 Panels, das Virtual-Grid ist 2 Zeilen × 2 Spalten.
 
 ### Pin-Belegung (HUB75E — 64px-hohe Panels benötigen E-Pin!)
 | Signal | GPIO |
@@ -168,14 +159,14 @@ struct FlightEntry {
 
 ## Display-Rendering
 
-### Pixel-Layout bei 256×64 (aktuell)
+### Pixel-Layout bei 256×64 (nicht aktiv, `matrixHeight < 128`)
 ```
 Y=0..18   : Kopfzeile (Icon, DEPARTURES/ARRIVALS, Uhrzeit, IATA-Badge, Status-Dot)
 Y=19      : Trennlinie (Amber)
 Y=20..63  : 3 Flugzeilen à 15 px Höhe
 ```
 
-### Pixel-Layout bei 256×128 (geplant)
+### Pixel-Layout bei 256×128 (aktuell)
 ```
 Y=0..18   : Kopfzeile
 Y=19..29  : Spaltenköpfe (TIME | FLIGHT | DEST/FROM | GATE/BELT | STATUS)
@@ -310,10 +301,10 @@ In `CITY_LOOKUP[]` in §5 eintragen:
 {"XXX", "STADTNAME"},
 ```
 
-### Display auf 256×128 umrüsten (4 Panels)
-1. `BOARD_PANEL_ROWS` von `1` auf `2` ändern
-2. `BOARD_CHAIN_TYPE` je nach Panel-Verkabelung anpassen (z. B. `CHAIN_TOP_LEFT_DOWN`)
-3. `cfg.matrixHeight` wird aus `BOARD_SCREEN_H` berechnet → automatisch 128 → 7-Zeilen-Layout aktiv
+### Panel-Anordnung (aktuell 256×128, U-Form)
+1. `BOARD_PANEL_ROWS` = `2`, `BOARD_PANEL_COLS` = `2`, `BOARD_PANEL_CHAIN` = `4`
+2. `BOARD_CHAIN_TYPE` = `CHAIN_TOP_LEFT_DOWN` (untere Reihe kopfüber). Alle Panels aufrecht wäre `CHAIN_TOP_LEFT_DOWN_ZZ`
+3. `cfg.matrixHeight` kommt aus `BOARD_SCREEN_H` → 128 → 7-Zeilen-Layout
 
 ### Timing-Konstanten anpassen
 Alle Zeitregeln stehen direkt unterhalb der `FlightEntry`-Struct:

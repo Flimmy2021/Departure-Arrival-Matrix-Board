@@ -4,7 +4,8 @@
   ============================================================================
   Hardware
    - ESP32 (esp32dev)
-   - 2x HUB75E LED Matrix Panels 128x64 nebeneinander = 256x64 (3 Flugzeilen)
+   - 4x HUB75E LED Matrix Panels 128x64, 2 Spalten x 2 Reihen = 256x128 (7 Flugzeilen)
+   - U-Verkettung: obere Reihe aufrecht links->rechts, untere Reihe ueber Kopf rechts->links
 
   Benoetigte Bibliotheken (siehe platformio.ini)
    1. ESP32 HUB75 LED MATRIX PANEL DMA Display (mrfaptastic)
@@ -46,11 +47,14 @@ static const char *API_KEY_PLACEHOLDER = "DEIN_AIRLABS_API_KEY_HIER";
 #define BOARD_PANEL_RES_X 128 // Breite eines einzelnen Panels
 #define BOARD_PANEL_RES_Y 64  // Hoehe eines einzelnen Panels
 #define BOARD_PANEL_COLS 2    // 2 Panels nebeneinander
-#define BOARD_PANEL_ROWS 1
+#define BOARD_PANEL_ROWS 2    // 2 Reihen untereinander (U-Form)
+#define BOARD_PANEL_CHAIN (BOARD_PANEL_ROWS * BOARD_PANEL_COLS) // 4 Panels in einer DMA-Kette
 #define BOARD_SCREEN_W (BOARD_PANEL_RES_X * BOARD_PANEL_COLS)  // 256
-#define BOARD_SCREEN_H (BOARD_PANEL_RES_Y * BOARD_PANEL_ROWS)  // 64
+#define BOARD_SCREEN_H (BOARD_PANEL_RES_Y * BOARD_PANEL_ROWS)  // 128
 
-// Bei einer Reihe ohne Bedeutung, wird nur vom VirtualMatrixPanel gebraucht
+// Serpentine / U-Form: Kette startet oben links und laeuft nach rechts,
+// die untere Reihe ist 180 Grad gedreht (ueber Kopf) und laeuft zurueck nach links.
+// CHAIN_TOP_LEFT_DOWN_ZZ waere Zickzack (alle Panels aufrecht, langes Rueckkabel).
 #define BOARD_CHAIN_TYPE CHAIN_TOP_LEFT_DOWN
 
 // 1 = Double-Buffering (flackerfrei, braucht viel DMA-RAM -> nur ESP32-S3 empfohlen)
@@ -237,7 +241,7 @@ void loadConfig() {
   cfg.wifiPass = prefs.getString("pass", "");
   cfg.apiKey = prefs.getString("api_key", AIRLABS_API_KEY);
   cfg.iataCode = prefs.getString("iata", "HAM");
-  cfg.matrixHeight = BOARD_SCREEN_H; // feste Hardware: 256x64
+  cfg.matrixHeight = BOARD_SCREEN_H; // feste Hardware: 256x128
   cfg.switchSeconds = prefs.getInt("sw_sec", 15);
   cfg.pollMinutes = prefs.getInt("poll_min", 10);
   cfg.brightness = prefs.getInt("bright", 90);
@@ -887,13 +891,15 @@ void drawClippedCellText(int x, int y, int maxW, const String &text, uint16_t co
 
 // --- Codeshare-Slide-Animation ---------------------------------------------------
 
-// Hilfsfunktion: zeichnet String s ab xStart mit pixelgenauem Clipping in [cellX..cellX+cellMaxW)
+// Hilfsfunktion: zeichnet String s ab xStart mit striktem Zeichen-Clipping in [cellX..cellX+cellMaxW)
+// Entspricht der Logik von drawClippedCellText: nur Zeichen, deren linke Kante innerhalb der Spalte liegt.
 static void drawCodeshareToken(int xStart, int cellX, int cellY, int cellMaxW,
                                const String &s, uint16_t color) {
   const int charW = 6;
   for (int i = 0; i < (int)s.length(); i++) {
     int cx = xStart + i * charW;
-    if (cx + charW - 1 >= cellX && cx < cellX + cellMaxW) {
+    // Striktes Clipping: linke Zeichenkante muss >= cellX sein, rechte <= cellX+cellMaxW
+    if (cx >= cellX && cx <= cellX + cellMaxW - 5) {
       gfx->drawChar(cx, cellY, s[i], color, COL_BG, 1);
     }
   }
@@ -918,6 +924,11 @@ void drawCodeshareAnimCell(const CodeshareAnimCell &cell) {
     gfx->setTextColor(cell.color);
     gfx->setCursor(cell.x, cell.y);
     gfx->print(cell.tokens[tokenIdx]);
+    // Kleiner 2×2-Punkt rechts der Flugnummer: zeigt an, dass weitere Nummern folgen
+    int dotX = cell.x + (int)cell.tokens[tokenIdx].length() * charW;
+    if (dotX + 2 <= cell.x + cell.maxW) {
+      gfx->fillRect(dotX, cell.y + 2, 2, 2, cell.color);
+    }
   } else {
     // Slide-Transition: aktuelle Nummer gleitet pixelweise links raus,
     // naechste kommt von rechts rein
@@ -1466,8 +1477,8 @@ void setup() {
   WiFi.mode(WIFI_STA);
   Serial.printf("Freier Heap nach WLAN-Init: %u (groesster Block %u)\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
-  // HUB75 / HUB75E Initialisierung: 2 Panels 128x64 nebeneinander = 256x64
-  HUB75_I2S_CFG mxconfig(BOARD_PANEL_RES_X, BOARD_PANEL_RES_Y, BOARD_PANEL_COLS);
+  // HUB75 / HUB75E: 4 Panels 128x64 als U (2x2) = 256x128
+  HUB75_I2S_CFG mxconfig(BOARD_PANEL_RES_X, BOARD_PANEL_RES_Y, BOARD_PANEL_CHAIN);
   mxconfig.gpio.r1 = BOARD_R1_PIN;
   mxconfig.gpio.g1 = BOARD_G1_PIN;
   mxconfig.gpio.b1 = BOARD_B1_PIN;
